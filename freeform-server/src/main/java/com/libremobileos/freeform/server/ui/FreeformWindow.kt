@@ -220,11 +220,15 @@ class FreeformWindow(
             return true
         }
 
-        if (handleBackGesture(event)) {
+        if (updateBackGesture(event)) {
             return true
         }
 
-        // Copy and transform the original event so we keep batched historical samples.
+        forwardTouch(event)
+        return true
+    }
+
+    private fun forwardTouch(event: MotionEvent) {
         val transformedEvent = MotionEvent.obtain(event)
         try {
             if (freeformConfig.scale != 1.0f) {
@@ -237,10 +241,25 @@ class FreeformWindow(
         } finally {
             transformedEvent.recycle()
         }
-        return true
     }
 
-    private fun handleBackGesture(event: MotionEvent): Boolean {
+    private fun forwardCancel(event: MotionEvent) {
+        val cancelEvent = MotionEvent.obtain(event)
+        cancelEvent.action = MotionEvent.ACTION_CANCEL
+        try {
+            if (freeformConfig.scale != 1.0f) {
+                val transform = Matrix()
+                transform.setScale(freeformConfig.scale, freeformConfig.scale)
+                cancelEvent.transform(transform)
+            }
+            cancelEvent.source = InputDevice.SOURCE_TOUCHSCREEN
+            LMOFreeformServiceHolder.touch(cancelEvent, displayId)
+        } finally {
+            cancelEvent.recycle()
+        }
+    }
+
+    private fun updateBackGesture(event: MotionEvent): Boolean {
         val edgeWidth = dpToPx(BACK_GESTURE_EDGE_WIDTH_DP)
         val triggerDistance = dpToPx(BACK_GESTURE_TRIGGER_DISTANCE_DP)
         val verticalSlop = dpToPx(BACK_GESTURE_VERTICAL_SLOP_DP)
@@ -255,37 +274,38 @@ class FreeformWindow(
                     event.x >= freeformView.width - edgeWidth -> BACK_GESTURE_EDGE_RIGHT
                     else -> BACK_GESTURE_EDGE_NONE
                 }
-                return backGestureEdge != BACK_GESTURE_EDGE_NONE
+                return false
             }
             MotionEvent.ACTION_MOVE -> {
                 if (backGestureEdge == BACK_GESTURE_EDGE_NONE) {
                     return false
                 }
-                if (!backGestureTriggered) {
-                    val dx = event.x - backGestureStartX
-                    val dy = kotlin.math.abs(event.y - backGestureStartY)
-                    val inwardDistance = when (backGestureEdge) {
-                        BACK_GESTURE_EDGE_LEFT -> dx
-                        BACK_GESTURE_EDGE_RIGHT -> -dx
-                        else -> 0f
-                    }
-                    if (inwardDistance >= triggerDistance && dy <= verticalSlop) {
-                        backGestureTriggered = true
-                        LMOFreeformServiceHolder.back(displayId)
-                    }
+                if (backGestureTriggered) {
+                    return true
                 }
-                return true
+                val dx = event.x - backGestureStartX
+                val dy = kotlin.math.abs(event.y - backGestureStartY)
+                val inwardDistance = when (backGestureEdge) {
+                    BACK_GESTURE_EDGE_LEFT -> dx
+                    BACK_GESTURE_EDGE_RIGHT -> -dx
+                    else -> 0f
+                }
+                if (inwardDistance >= triggerDistance && dy <= verticalSlop) {
+                    backGestureTriggered = true
+                    forwardCancel(event)
+                    LMOFreeformServiceHolder.back(displayId)
+                    return true
+                }
+                return false
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (backGestureEdge == BACK_GESTURE_EDGE_NONE) {
-                    return false
-                }
+                val consumed = backGestureTriggered
                 backGestureEdge = BACK_GESTURE_EDGE_NONE
                 backGestureTriggered = false
-                return true
+                return consumed
             }
         }
-        return backGestureEdge != BACK_GESTURE_EDGE_NONE
+        return false
     }
 
     private fun updateSystemGestureExclusion() {
