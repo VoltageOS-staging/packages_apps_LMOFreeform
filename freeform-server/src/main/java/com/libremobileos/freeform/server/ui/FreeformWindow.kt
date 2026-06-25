@@ -51,7 +51,9 @@ class FreeformWindow(
     lateinit var freeformRootView: ViewGroup
     lateinit var freeformView: TextureView
     private lateinit var topBarView: View
-    private lateinit var bottomBarView: View
+    private var bottomBarView: View? = null
+    private var optionsMenuView: View? = null
+    private var optionsScrimView: View? = null
     private var displayId = Display.INVALID_DISPLAY
     private var backGestureEdge = BACK_GESTURE_EDGE_NONE
     private var backGestureStartX = 0f
@@ -179,13 +181,6 @@ class FreeformWindow(
                 startApp()
             }
 
-            val arrowBack = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "arrowBack")
-            if (null == arrowBack) {
-                Slog.e(TAG, "right&rightScale view is null")
-                destroy("onDisplayAdd:backView is null")
-                return@post
-            }
-            arrowBack.setOnClickListener(RightViewClickListener(displayId))
         }
     }
 
@@ -220,11 +215,15 @@ class FreeformWindow(
             return true
         }
 
-        if (handleBackGesture(event)) {
+        if (updateBackGesture(event)) {
             return true
         }
 
-        // Copy and transform the original event so we keep batched historical samples.
+        forwardTouch(event)
+        return true
+    }
+
+    private fun forwardTouch(event: MotionEvent) {
         val transformedEvent = MotionEvent.obtain(event)
         try {
             if (freeformConfig.scale != 1.0f) {
@@ -237,10 +236,25 @@ class FreeformWindow(
         } finally {
             transformedEvent.recycle()
         }
-        return true
     }
 
-    private fun handleBackGesture(event: MotionEvent): Boolean {
+    private fun forwardCancel(event: MotionEvent) {
+        val cancelEvent = MotionEvent.obtain(event)
+        cancelEvent.action = MotionEvent.ACTION_CANCEL
+        try {
+            if (freeformConfig.scale != 1.0f) {
+                val transform = Matrix()
+                transform.setScale(freeformConfig.scale, freeformConfig.scale)
+                cancelEvent.transform(transform)
+            }
+            cancelEvent.source = InputDevice.SOURCE_TOUCHSCREEN
+            LMOFreeformServiceHolder.touch(cancelEvent, displayId)
+        } finally {
+            cancelEvent.recycle()
+        }
+    }
+
+    private fun updateBackGesture(event: MotionEvent): Boolean {
         val edgeWidth = dpToPx(BACK_GESTURE_EDGE_WIDTH_DP)
         val triggerDistance = dpToPx(BACK_GESTURE_TRIGGER_DISTANCE_DP)
         val verticalSlop = dpToPx(BACK_GESTURE_VERTICAL_SLOP_DP)
@@ -255,37 +269,38 @@ class FreeformWindow(
                     event.x >= freeformView.width - edgeWidth -> BACK_GESTURE_EDGE_RIGHT
                     else -> BACK_GESTURE_EDGE_NONE
                 }
-                return backGestureEdge != BACK_GESTURE_EDGE_NONE
+                return false
             }
             MotionEvent.ACTION_MOVE -> {
                 if (backGestureEdge == BACK_GESTURE_EDGE_NONE) {
                     return false
                 }
-                if (!backGestureTriggered) {
-                    val dx = event.x - backGestureStartX
-                    val dy = kotlin.math.abs(event.y - backGestureStartY)
-                    val inwardDistance = when (backGestureEdge) {
-                        BACK_GESTURE_EDGE_LEFT -> dx
-                        BACK_GESTURE_EDGE_RIGHT -> -dx
-                        else -> 0f
-                    }
-                    if (inwardDistance >= triggerDistance && dy <= verticalSlop) {
-                        backGestureTriggered = true
-                        LMOFreeformServiceHolder.back(displayId)
-                    }
+                if (backGestureTriggered) {
+                    return true
                 }
-                return true
+                val dx = event.x - backGestureStartX
+                val dy = kotlin.math.abs(event.y - backGestureStartY)
+                val inwardDistance = when (backGestureEdge) {
+                    BACK_GESTURE_EDGE_LEFT -> dx
+                    BACK_GESTURE_EDGE_RIGHT -> -dx
+                    else -> 0f
+                }
+                if (inwardDistance >= triggerDistance && dy <= verticalSlop) {
+                    backGestureTriggered = true
+                    forwardCancel(event)
+                    LMOFreeformServiceHolder.back(displayId)
+                    return true
+                }
+                return false
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (backGestureEdge == BACK_GESTURE_EDGE_NONE) {
-                    return false
-                }
+                val consumed = backGestureTriggered
                 backGestureEdge = BACK_GESTURE_EDGE_NONE
                 backGestureTriggered = false
-                return true
+                return consumed
             }
         }
-        return backGestureEdge != BACK_GESTURE_EDGE_NONE
+        return false
     }
 
     private fun updateSystemGestureExclusion() {
@@ -304,6 +319,39 @@ class FreeformWindow(
     }
 
     private fun dpToPx(dp: Int): Float = dp * context.resources.displayMetrics.density
+
+    private fun toggleOptionsMenu() {
+        val menu = optionsMenuView ?: return
+        if (menu.visibility == View.VISIBLE) hideOptionsMenu() else showOptionsMenu()
+    }
+
+    private fun showOptionsMenu() {
+        optionsScrimView?.visibility = View.VISIBLE
+        optionsMenuView?.visibility = View.VISIBLE
+    }
+
+    private fun hideOptionsMenu() {
+        optionsMenuView?.visibility = View.GONE
+        optionsScrimView?.visibility = View.GONE
+    }
+
+    private fun snapToEdges() {
+        if (freeformConfig.isHangUp) return
+        val screenW = defaultDisplayWidth
+        val winW = freeformConfig.width
+        if (winW <= 0 || winW >= screenW) return
+        if (windowParams.x <= -(screenW / 2) || windowParams.x >= screenW / 2) return
+        val threshold = dpToPx(40).roundToInt()
+        val leftEdge = screenW / 2 + windowParams.x - winW / 2
+        val rightEdge = screenW / 2 + windowParams.x + winW / 2
+        val snapLeftX = -((screenW - winW) / 2)
+        val snapRightX = (screenW - winW) / 2
+        if (leftEdge <= threshold && windowParams.x != snapLeftX) {
+            FreeformAnimation.moveInScreenAnimator(windowParams.x, snapLeftX, 200, true, this)
+        } else if (rightEdge >= screenW - threshold && windowParams.x != snapRightX) {
+            FreeformAnimation.moveInScreenAnimator(windowParams.x, snapRightX, 200, true, this)
+        }
+    }
 
     /**
      * get freeform screen dimen / freeform view dimen
@@ -355,28 +403,55 @@ class FreeformWindow(
         freeformLayout = tmpFreeformLayout
         freeformRootView = resourceHolder.getLayoutChildViewByTag<FrameLayout>(freeformLayout, "freeform_root") ?: return false
         topBarView = resourceHolder.getLayoutChildViewByTag(freeformLayout, "topBarView") ?: return false
-        bottomBarView = resourceHolder.getLayoutChildViewByTag(freeformLayout, "bottomBarView") ?: return false
-        val moveTouchListener = MoveTouchListener(this)
-        topBarView.setOnTouchListener(moveTouchListener)
-        bottomBarView.setOnTouchListener(moveTouchListener)
-        val appIconView = resourceHolder.getLayoutChildViewByTag<ImageView>(freeformLayout, "appIcon")
-        val packageNameView = resourceHolder.getLayoutChildViewByTag<TextView>(freeformLayout, "packageName")
-        val maximizeView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "maximizeView")
-        val minimizeView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "minimizeView")
-        val pinView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "pinView")
+        val topBarMoveListener = MoveTouchListener(this)
+        val topBarTapDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                handler.post { MaximizeClickListener(this@FreeformWindow).onClick(topBarView) }
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                handler.post { handleHangUp() }
+            }
+        })
+        topBarView.setOnTouchListener { v, event ->
+            topBarTapDetector.onTouchEvent(event)
+            val handled = topBarMoveListener.onTouch(v, event)
+            if (event.actionMasked == MotionEvent.ACTION_UP) snapToEdges()
+            handled
+        }
+
+        val optionsView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "optionsView")
+        val optionsMenu = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "optionsMenu")
+        val optionsScrim = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "optionsScrim")
+        val menuFullscreen = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "menuFullscreen")
+        val menuMinimize = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "menuMinimize")
+        val menuClose = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "menuClose")
         val leftScaleView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "leftScaleView")
         val rightScaleView = resourceHolder.getLayoutChildViewByTag<View>(freeformLayout, "rightScaleView")
-        if (null == minimizeView || null == leftScaleView || null == rightScaleView 
-                || null == maximizeView || null == pinView || null == appIconView || null == packageNameView) {
-            Slog.e(TAG, "left&leftScale&rightScale view is null")
-            destroy("addFreeformView:left&leftScale&rightScale view is null")
+        if (null == optionsView || null == optionsMenu || null == optionsScrim
+                || null == menuFullscreen || null == menuMinimize || null == menuClose
+                || null == leftScaleView || null == rightScaleView) {
+            Slog.e(TAG, "freeform chrome view is null")
+            destroy("addFreeformView:freeform chrome view is null")
             return false
         }
-        appIconView.setImageDrawable(appIcon)
-        packageNameView.text = appPackageName
-        minimizeView.setOnClickListener(LeftViewClickListener(this))
-        maximizeView.setOnClickListener(MaximizeClickListener(this))
-        pinView.setOnClickListener(PinClickListener(this))
+        optionsMenuView = optionsMenu
+        optionsScrimView = optionsScrim
+        optionsView.setOnClickListener { toggleOptionsMenu() }
+        optionsScrim.setOnClickListener { hideOptionsMenu() }
+        menuFullscreen.setOnClickListener {
+            hideOptionsMenu()
+            MaximizeClickListener(this).onClick(it)
+        }
+        menuMinimize.setOnClickListener {
+            hideOptionsMenu()
+            handler.post { handleHangUp() }
+        }
+        menuClose.setOnClickListener {
+            hideOptionsMenu()
+            close()
+        }
         leftScaleView.setOnTouchListener(ScaleTouchListener(this, false))
         rightScaleView.setOnTouchListener(ScaleTouchListener(this))
 
@@ -399,6 +474,8 @@ class FreeformWindow(
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
                     WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
+            privateFlags = privateFlags or
+                    WindowManager.LayoutParams.PRIVATE_FLAG_UNRESTRICTED_GESTURE_EXCLUSION
             format = PixelFormat.RGBA_8888
             windowAnimations = android.R.style.Animation_Dialog
         }
@@ -419,6 +496,7 @@ class FreeformWindow(
      */
     @SuppressLint("ClickableViewAccessibility")
     fun handleHangUp() {
+        hideOptionsMenu()
         if (freeformConfig.isHangUp) {
             windowParams.apply {
                 x = freeformConfig.notInHangUpX
@@ -431,7 +509,7 @@ class FreeformWindow(
             }
             windowManager.updateViewLayout(freeformLayout, windowParams)
             topBarView.visibility = View.VISIBLE
-            bottomBarView.visibility = View.VISIBLE
+            bottomBarView?.visibility = View.VISIBLE
             freeformConfig.isHangUp = false
             freeformView.setOnTouchListener(this)
         } else {
@@ -439,7 +517,7 @@ class FreeformWindow(
             freeformConfig.notInHangUpY = windowParams.y
             toHangUp()
             topBarView.visibility = View.GONE
-            bottomBarView.visibility = View.GONE
+            bottomBarView?.visibility = View.GONE
             freeformConfig.isHangUp = true
             val gestureDetector = GestureDetector(context, hangUpGestureListener)
             freeformView.setOnTouchListener { _, event ->
